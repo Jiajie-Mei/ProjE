@@ -1,5 +1,6 @@
 import argparse
 import math
+import pickle
 import os.path
 import timeit
 from multiprocessing import JoinableQueue, Queue, Process
@@ -12,6 +13,10 @@ class ProjE:
     @property
     def n_entity(self):
         return self.__n_entity
+
+    @property
+    def n_relation(self):
+        return self.__n_relation
 
     @property
     def n_train(self):
@@ -118,30 +123,30 @@ class ProjE:
         self.__trainable = list()
         self.__dropout = dropout
 
-        with open(os.path.join(data_dir, 'entity2id.txt'), 'r', encoding='utf-8') as f:
-            self.__n_entity = len(f.readlines())
-
-        with open(os.path.join(data_dir, 'entity2id.txt'), 'r', encoding='utf-8') as f:
-            self.__entity_id_map = {x.strip().split('\t')[0]: int(x.strip().split('\t')[1]) for x in f.readlines()}
-            self.__id_entity_map = {v: k for k, v in self.__entity_id_map.items()}
+        with open(os.path.join(data_dir, 'stat_entities.csv'), 'r', encoding='utf-8') as f:
+            lines = [line for line in f if line.strip()]
+            self.__n_entity = len(lines) - 1
+            del lines
 
         print("N_ENTITY: %d" % self.__n_entity)
 
-        with open(os.path.join(data_dir, 'relation2id.txt'), 'r', encoding='utf-8') as f:
-            self.__n_relation = len(f.readlines())
-
-        with open(os.path.join(data_dir, 'relation2id.txt'), 'r', encoding='utf-8') as f:
-            self.__relation_id_map = {x.strip().split('\t')[0]: int(x.strip().split('\t')[1]) for x in f.readlines()}
-            self.__id_relation_map = {v: k for k, v in self.__entity_id_map.items()}
+        with open(os.path.join(data_dir, 'stat_relations.csv'), 'r', encoding='utf-8') as f:
+            lines = [line for line in f if line.strip()]
+            self.__n_relation = len(lines) - 1
+            del lines
 
         print("N_RELATION: %d" % self.__n_relation)
 
         def load_triple(file_path):
             with open(file_path, 'r', encoding='utf-8') as f_triple:
-                return np.asarray([[self.__entity_id_map[x.strip().split('\t')[0]],
-                                    self.__entity_id_map[x.strip().split('\t')[1]],
-                                    self.__relation_id_map[x.strip().split('\t')[2]]] for x in f_triple.readlines()],
-                                  dtype=np.int32)
+                triples = []
+                for index_line, line in enumerate(f_triple):
+                    line = line.strip()
+                    if index_line % 2 == 0 or not line:
+                        continue
+                    h, r, t = list(map(lambda x: int(x), line.split(',')))
+                    triples.append([h, t, r])
+                return np.asarray(triples, dtype=np.int32)
 
         def gen_hr_t(triple_data):
             hr_t = dict()
@@ -164,13 +169,13 @@ class ProjE:
                 tr_h[t][r].add(h)
             return tr_h
 
-        self.__train_triple = load_triple(os.path.join(data_dir, 'train.txt'))
+        self.__train_triple = load_triple(os.path.join(data_dir, 'train.csv'))
         print("N_TRAIN_TRIPLES: %d" % self.__train_triple.shape[0])
 
-        self.__test_triple = load_triple(os.path.join(data_dir, 'test.txt'))
+        self.__test_triple = load_triple(os.path.join(data_dir, 'test.csv'))
         print("N_TEST_TRIPLES: %d" % self.__test_triple.shape[0])
 
-        self.__valid_triple = load_triple(os.path.join(data_dir, 'valid.txt'))
+        self.__valid_triple = load_triple(os.path.join(data_dir, 'valid.csv'))
         print("N_VALID_TRIPLES: %d" % self.__valid_triple.shape[0])
 
         self.__train_hr_t = gen_hr_t(self.__train_triple)
@@ -339,6 +344,7 @@ class ProjE:
 
                 hrt_res = tf.matmul(tf.tanh(hr + self.__hr_combination_bias), ent_mat)
                 _, tail_ids = tf.nn.top_k(hrt_res, k=self.__n_entity)
+                prob_over_tails = tf.nn.softmax(hrt_res, axis=-1)
 
                 # predict heads
 
@@ -346,6 +352,7 @@ class ProjE:
 
                 trh_res = tf.matmul(tf.tanh(tr + self.__tr_combination_bias), ent_mat)
                 _, head_ids = tf.nn.top_k(trh_res, k=self.__n_entity)
+                prob_over_heads = tf.nn.softmax(trh_res, axis=-1)
 
             else:
 
@@ -358,7 +365,7 @@ class ProjE:
 
                 _, head_ids = tf.nn.top_k(trh_res, k=self.__n_entity)
 
-            return head_ids, tail_ids
+            return head_ids, tail_ids, prob_over_heads, prob_over_tails
 
 
 def train_ops(model: ProjE, learning_rate=0.1, optimizer_str='gradient', regularizer_weight=1.0):
@@ -389,9 +396,9 @@ def train_ops(model: ProjE, learning_rate=0.1, optimizer_str='gradient', regular
 def test_ops(model: ProjE):
     with tf.device('/cpu'):
         test_input = tf.placeholder(tf.int32, [None, 3])
-        head_ids, tail_ids = model.test(test_input)
+        head_ids, tail_ids, prob_over_heads, prob_over_tails = model.test(test_input)
 
-    return test_input, head_ids, tail_ids
+    return test_input, head_ids, tail_ids, prob_over_heads, prob_over_tails
 
 
 def worker_func(in_queue: JoinableQueue, out_queue: Queue, hr_t, tr_h):
@@ -450,21 +457,21 @@ def test_evaluation(testing_data, head_pred, tail_pred, hr_t, tr_h):
         r = testing_data[i, 2]
         # mean rank
 
-        mr = 0
+        mr = 1
         for val in head_pred[i]:
             if val == h:
                 mean_rank_h.append(mr)
                 break
             mr += 1
 
-        mr = 0
+        mr = 1
         for val in tail_pred[i]:
             if val == t:
                 mean_rank_t.append(mr)
             mr += 1
 
         # filtered mean rank
-        fmr = 0
+        fmr = 1
         for val in head_pred[i]:
             if val == h:
                 filtered_mean_rank_h.append(fmr)
@@ -474,7 +481,7 @@ def test_evaluation(testing_data, head_pred, tail_pred, hr_t, tr_h):
             else:
                 fmr += 1
 
-        fmr = 0
+        fmr = 1
         for val in tail_pred[i]:
             if val == t:
                 filtered_mean_rank_t.append(fmr)
@@ -485,6 +492,19 @@ def test_evaluation(testing_data, head_pred, tail_pred, hr_t, tr_h):
                 fmr += 1
 
     return (mean_rank_h, filtered_mean_rank_h), (mean_rank_t, filtered_mean_rank_t)
+
+
+def hit_at_k(ranks, k):
+    return np.mean(np.less_equal(ranks, k).astype(np.float32))
+
+
+def metrics_core(ranks):
+    float_ranks = np.asarray(ranks).astype(np.float32)
+    reciprocal_ranks = np.reciprocal(float_ranks)
+    mr = np.mean(float_ranks)
+    mrr = np.mean(reciprocal_ranks)
+
+    return hit_at_k(ranks, 1), hit_at_k(ranks, 3), hit_at_k(ranks, 10), mr, mrr
 
 
 def main(_):
@@ -523,7 +543,7 @@ def main(_):
     train_loss, train_op = train_ops(model, learning_rate=args.lr,
                                      optimizer_str=args.optimizer,
                                      regularizer_weight=args.loss_weight)
-    test_input, test_head, test_tail = test_ops(model)
+    test_input, test_head, test_tail, prob_over_heads, prob_over_tails = test_ops(model)
 
     with tf.Session() as session:
         tf.initialize_all_variables().run()
@@ -553,48 +573,6 @@ def main(_):
         for i in range(args.n_worker):
             worker = Process(target=worker_func, args=(evaluation_queue, result_queue, model.hr_t, model.tr_h))
             worker.start()
-
-        for data_func, test_type in zip([model.validation_data, model.testing_data], ['VALID', 'TEST']):
-            accu_mean_rank_h = list()
-            accu_mean_rank_t = list()
-            accu_filtered_mean_rank_h = list()
-            accu_filtered_mean_rank_t = list()
-
-            evaluation_count = 0
-
-            for testing_data in data_func(batch_size=args.eval_batch):
-                head_pred, tail_pred = session.run([test_head, test_tail],
-                                                   {test_input: testing_data})
-
-                evaluation_queue.put((testing_data, head_pred, tail_pred))
-                evaluation_count += 1
-
-            for i in range(args.n_worker):
-                evaluation_queue.put(None)
-
-            print("waiting for worker finishes their work")
-            evaluation_queue.join()
-            print("all worker stopped.")
-            while evaluation_count > 0:
-                evaluation_count -= 1
-
-                (mrh, fmrh), (mrt, fmrt) = result_queue.get()
-                accu_mean_rank_h += mrh
-                accu_mean_rank_t += mrt
-                accu_filtered_mean_rank_h += fmrh
-                accu_filtered_mean_rank_t += fmrt
-
-            print(
-                "[%s] INITIALIZATION [HEAD PREDICTION] MEAN RANK: %.1f FILTERED MEAN RANK %.1f HIT@10 %.3f FILTERED HIT@10 %.3f" %
-                (test_type, np.mean(accu_mean_rank_h), np.mean(accu_filtered_mean_rank_h),
-                 np.mean(np.asarray(accu_mean_rank_h, dtype=np.int32) < 10),
-                 np.mean(np.asarray(accu_filtered_mean_rank_h, dtype=np.int32) < 10)))
-
-            print(
-                "[%s] INITIALIZATION [TAIL PREDICTION] MEAN RANK: %.1f FILTERED MEAN RANK %.1f HIT@10 %.3f FILTERED HIT@10 %.3f" %
-                (test_type, np.mean(accu_mean_rank_t), np.mean(accu_filtered_mean_rank_t),
-                 np.mean(np.asarray(accu_mean_rank_t, dtype=np.int32) < 10),
-                 np.mean(np.asarray(accu_filtered_mean_rank_t, dtype=np.int32) < 10)))
 
         for n_iter in range(iter_offset, args.max_iter):
             start_time = timeit.default_timer()
@@ -642,47 +620,147 @@ def main(_):
 
             if n_iter % args.eval_per == 0 or n_iter == args.max_iter - 1:
 
-                for data_func, test_type in zip([model.validation_data, model.testing_data], ['VALID', 'TEST']):
-                    accu_mean_rank_h = list()
-                    accu_mean_rank_t = list()
-                    accu_filtered_mean_rank_h = list()
-                    accu_filtered_mean_rank_t = list()
+                data_func = model.testing_data
+                test_type = 'TEST'
+                accu_mean_rank_h = list()
+                accu_mean_rank_t = list()
+                accu_filtered_mean_rank_h = list()
+                accu_filtered_mean_rank_t = list()
 
-                    evaluation_count = 0
+                evaluation_count = 0
 
-                    for testing_data in data_func(batch_size=args.eval_batch):
-                        head_pred, tail_pred = session.run([test_head, test_tail],
-                                                           {test_input: testing_data})
+                if n_iter == args.max_iter - 1:
+                    dict_condition2score = dict()
+                    print('start to store for max-k')
 
-                        evaluation_queue.put((testing_data, head_pred, tail_pred))
-                        evaluation_count += 1
+                for testing_data in data_func(batch_size=args.eval_batch):
+                    head_pred, tail_pred = session.run([test_head, test_tail],
+                                                       {test_input: testing_data})
 
-                    for i in range(args.n_worker):
-                        evaluation_queue.put(None)
+                    evaluation_queue.put((testing_data, head_pred, tail_pred))
+                    evaluation_count += 1
 
-                    print("waiting for worker finishes their work")
-                    evaluation_queue.join()
-                    print("all worker stopped.")
-                    while evaluation_count > 0:
-                        evaluation_count -= 1
+                    # save for max-k
+                    if n_iter == args.max_iter - 1:
+                        val_prob_over_heads, val_prob_over_tails = session.run(
+                            [prob_over_heads, prob_over_tails], {test_input: testing_data})
+                        batch_h = testing_data[:, 0]  # [batch_size]
+                        batch_t = testing_data[:, 1]  # [batch_size]
+                        batch_r = testing_data[:, 2]  # [batch_size]
 
-                        (mrh, fmrh), (mrt, fmrt) = result_queue.get()
-                        accu_mean_rank_h += mrh
-                        accu_mean_rank_t += mrt
-                        accu_filtered_mean_rank_h += fmrh
-                        accu_filtered_mean_rank_t += fmrt
+                        zipped_tuple = zip(batch_h, batch_t, batch_r, val_prob_over_heads, val_prob_over_tails)
+                        for one_h, one_t, one_r, one_prob_heads, one_prob_tails in zipped_tuple:
+                            condition = (one_h, one_r)
+                            if condition not in dict_condition2score:
+                                dict_condition2score[condition] = one_prob_tails
+                            condition = (one_t, one_r + model.n_relation)  # inverse relation
+                            if condition not in dict_condition2score:
+                                dict_condition2score[condition] = one_prob_heads
 
-                    print(
-                        "[%s] ITER %d [HEAD PREDICTION] MEAN RANK: %.1f FILTERED MEAN RANK %.1f HIT@10 %.3f FILTERED HIT@10 %.3f" %
-                        (test_type, n_iter, np.mean(accu_mean_rank_h), np.mean(accu_filtered_mean_rank_h),
-                         np.mean(np.asarray(accu_mean_rank_h, dtype=np.int32) < 10),
-                         np.mean(np.asarray(accu_filtered_mean_rank_h, dtype=np.int32) < 10)))
+                if n_iter == args.max_iter - 1:
+                    field_h = 'h'
+                    field_r = 'r'
+                    field_probs = 'probs'
+                    path_max_k_probs = 'max_k_probs'
+                    batch_size = 256
 
-                    print(
-                        "[%s] ITER %d [TAIL PREDICTION] MEAN RANK: %.1f FILTERED MEAN RANK %.1f HIT@10 %.3f FILTERED HIT@10 %.3f" %
-                        (test_type, n_iter, np.mean(accu_mean_rank_t), np.mean(accu_filtered_mean_rank_t),
-                         np.mean(np.asarray(accu_mean_rank_t, dtype=np.int32) < 10),
-                         np.mean(np.asarray(accu_filtered_mean_rank_t, dtype=np.int32) < 10)))
+                    # dump for max-k
+                    print('start dumping for max-k')
+                    if not os.path.exists(path_max_k_probs):
+                        os.makedirs(path_max_k_probs)
+
+                    list_heads = []
+                    list_relations = []
+                    list_scores = []
+                    index_batch = 0
+                    for (head, relation), score in dict_condition2score.items():
+                        list_heads.append(head)
+                        list_relations.append(relation)
+                        list_scores.append(score)
+
+                        if len(list_heads) == batch_size:
+                            with open(os.path.join(path_max_k_probs, 'batch_%05d.pkl' % index_batch), 'wb') as f:
+                                result = {
+                                    field_h: np.array(list_heads, np.int32, copy=False),
+                                    field_r: np.array(list_relations, np.int32, copy=False),
+                                    field_probs: np.array(list_scores, np.float32, copy=False)
+                                }
+                                pickle.dump(result, f)
+                                print('dump for batch %d' % index_batch)
+                            del result, list_heads, list_relations, list_scores
+                            list_heads = []
+                            list_relations = []
+                            list_scores = []
+                            index_batch += 1
+                    if len(list_heads) > 0:
+                        with open(os.path.join(path_max_k_probs, 'batch_%05d.pkl' % index_batch), 'wb') as f:
+                            result = {
+                                field_h: np.array(list_heads, np.int32, copy=False),
+                                field_r: np.array(list_relations, np.int32, copy=False),
+                                field_probs: np.array(list_scores, np.float32, copy=False)
+                            }
+                            pickle.dump(result, f)
+                            print('dump for batch %d' % index_batch)
+                    print('finished dumping max-k, %d keys' % len(dict_condition2score))
+
+                for i in range(args.n_worker):
+                    evaluation_queue.put(None)
+
+                print("waiting for worker finishes their work")
+                evaluation_queue.join()
+                print("all worker stopped.")
+                while evaluation_count > 0:
+                    evaluation_count -= 1
+
+                    (mrh, fmrh), (mrt, fmrt) = result_queue.get()
+                    accu_mean_rank_h += mrh
+                    accu_mean_rank_t += mrt
+                    accu_filtered_mean_rank_h += fmrh
+                    accu_filtered_mean_rank_t += fmrt
+
+                raw_ranks = accu_mean_rank_h + accu_mean_rank_t
+                filtered_ranks = accu_filtered_mean_rank_h + accu_filtered_mean_rank_t
+
+                metrics_raw = [
+                    metrics_core(filtered_ranks),
+                    metrics_core(accu_filtered_mean_rank_h),
+                    metrics_core(accu_filtered_mean_rank_t)
+                ]
+                metrics_filter = [
+                    metrics_core(raw_ranks),
+                    metrics_core(accu_mean_rank_h),
+                    metrics_core(accu_mean_rank_t)
+                ]
+
+                result_pair = [metrics_filter, metrics_raw]
+
+                num_metrics = 5  # hit@1,3,10, mr, mrr
+                num_modes = 1  # full prediction, head prediction and tail prediction
+
+                formated_metrics = []
+                for i in range(num_modes):
+                    formated_metrics.append([])
+                    # fill in filtered metrics
+                    for j in range(num_metrics):
+                        formated_metrics[-1].append(result_pair[0][i][j])
+                    # fill in raw metrics
+                    for j in range(num_metrics):
+                        formated_metrics[-1].append(result_pair[1][i][j])
+
+                with open('link.csv', 'w') as f:
+                    name_metrics = ['h@1', 'h@3', 'h@10', 'MR', 'MRR']
+                    id_mean_rank = name_metrics.index('MR')
+                    f.write('\t'.join(['mode'] + ['filt: ' + item for item in name_metrics] + name_metrics) + '\n')
+
+                    for metrics, pred_mode in zip(formated_metrics, ['ProjE', 'ProjE(head)', 'ProjE(tail)']):
+                        str_metrics = [
+                            '{:.3f}'.format(metric) if i not in [id_mean_rank, num_metrics + id_mean_rank]
+                            else '{:.0f}'.format(metric)
+                            for i, metric in enumerate(metrics)
+                        ]
+                        f.write('\t'.join([pred_mode] + str_metrics) + '\n')
+
+                print('finished link prediction')
 
 
 if __name__ == '__main__':
