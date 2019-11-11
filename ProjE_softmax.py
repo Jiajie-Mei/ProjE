@@ -735,7 +735,7 @@ def main(_):
                 result_pair = [metrics_filter, metrics_raw]
 
                 num_metrics = 5  # hit@1,3,10, mr, mrr
-                num_modes = 1  # full prediction, head prediction and tail prediction
+                num_modes = 3  # full prediction, head prediction and tail prediction
 
                 formated_metrics = []
                 for i in range(num_modes):
