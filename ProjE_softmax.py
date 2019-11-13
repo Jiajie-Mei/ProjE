@@ -721,12 +721,12 @@ def main(_):
                 raw_ranks = accu_mean_rank_h + accu_mean_rank_t
                 filtered_ranks = accu_filtered_mean_rank_h + accu_filtered_mean_rank_t
 
-                metrics_raw = [
+                metrics_filter = [
                     metrics_core(filtered_ranks),
                     metrics_core(accu_filtered_mean_rank_h),
                     metrics_core(accu_filtered_mean_rank_t)
                 ]
-                metrics_filter = [
+                metrics_raw = [
                     metrics_core(raw_ranks),
                     metrics_core(accu_mean_rank_h),
                     metrics_core(accu_mean_rank_t)
